@@ -87,11 +87,26 @@ print_header "Overall Summary"
 
 TOTAL_PODS=$(kubectl get pods -A 2>/dev/null | grep -E 'kubeflow|istio-system|knative|cert-manager|auth' | wc -l)
 RUNNING_PODS=$(kubectl get pods -A 2>/dev/null | grep -E 'kubeflow|istio-system|knative|cert-manager|auth' | grep Running | wc -l)
+PENDING_PODS=$(kubectl get pods -A 2>/dev/null | grep -E 'kubeflow|istio-system|knative|cert-manager|auth' | grep -E 'Pending|ContainerCreating|PodInitializing|Init' | wc -l)
 ERROR_PODS=$(kubectl get pods -A 2>/dev/null | grep -E 'kubeflow|istio-system|knative|cert-manager|auth' | grep -E 'Error|CrashLoopBackOff|ImagePullBackOff' | wc -l)
 
 echo "Total Kubeflow pods: $TOTAL_PODS"
 echo "Running: $RUNNING_PODS"
-echo "Errors: $ERROR_PODS"
+if [ "$PENDING_PODS" -gt 0 ]; then
+    echo "Pending/Initializing: $PENDING_PODS"
+fi
+if [ "$ERROR_PODS" -gt 0 ]; then
+    echo "Errors: $ERROR_PODS"
+fi
+
+# Check critical components
+CRITICAL_MISSING=0
+if ! kubectl get namespace kubeflow &> /dev/null; then
+    CRITICAL_MISSING=$((CRITICAL_MISSING + 1))
+fi
+if ! kubectl get crd notebooks.kubeflow.org &> /dev/null; then
+    CRITICAL_MISSING=$((CRITICAL_MISSING + 1))
+fi
 
 PERCENTAGE=0
 if [ "$TOTAL_PODS" -gt 0 ]; then
@@ -101,12 +116,27 @@ fi
 echo "Progress: $PERCENTAGE%"
 echo ""
 
-if [ "$PERCENTAGE" -eq 100 ]; then
+# Only report fully deployed if all critical components exist and all pods are running
+if [ "$PERCENTAGE" -eq 100 ] && [ "$CRITICAL_MISSING" -eq 0 ] && [ "$PENDING_PODS" -eq 0 ] && [ "$ERROR_PODS" -eq 0 ]; then
     print_success "Kubeflow is fully deployed! 🎉"
     echo ""
     echo "You can now access the dashboard:"
     echo "  ./scripts/04_access_dashboard.sh"
-elif [ "$PERCENTAGE" -gt 80 ]; then
+elif [ "$CRITICAL_MISSING" -gt 0 ]; then
+    print_warning "Deployment in progress - waiting for critical components..."
+    if ! kubectl get namespace kubeflow &> /dev/null; then
+        echo "  - kubeflow namespace not yet created"
+    fi
+    if ! kubectl get crd notebooks.kubeflow.org &> /dev/null; then
+        echo "  - Notebook CRDs not yet installed"
+    fi
+    echo ""
+    echo "The deployment script may still be running or needs to continue."
+    echo "If deployment was interrupted, you may need to re-run:"
+    echo "  ./scripts/02_deploy_kubeflow.sh"
+    echo ""
+    echo "Run this script again to check progress."
+elif [ "$PERCENTAGE" -gt 80 ] && [ "$PENDING_PODS" -eq 0 ]; then
     print_warning "Kubeflow is almost ready. Please wait a few more minutes."
     echo "Run this script again to check progress."
 elif [ "$ERROR_PODS" -gt 0 ]; then
@@ -114,6 +144,9 @@ elif [ "$ERROR_PODS" -gt 0 ]; then
     echo "  kubectl logs <pod-name> -n <namespace>"
 else
     print_warning "Deployment in progress ($PERCENTAGE% complete)"
+    if [ "$PENDING_PODS" -gt 0 ]; then
+        echo "Waiting for $PENDING_PODS pod(s) to start..."
+    fi
     echo "This may take 10-15 minutes. Please wait..."
     echo "Run this script again to check progress."
 fi

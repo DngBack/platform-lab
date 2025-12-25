@@ -48,7 +48,15 @@ echo ""
 echo "Choose installation method:"
 echo "1. Quick install (all components at once) - Faster but less control"
 echo "2. Step-by-step install (component by component) - Slower but educational"
-read -p "Enter choice (1 or 2): " INSTALL_METHOD
+while true; do
+    read -p "Enter choice (1 or 2): " INSTALL_METHOD
+    INSTALL_METHOD=$(echo "$INSTALL_METHOD" | tr -d '[:space:]')  # Trim whitespace
+    if [ "$INSTALL_METHOD" = "1" ] || [ "$INSTALL_METHOD" = "2" ]; then
+        break
+    else
+        print_error "Invalid choice. Please enter 1 or 2."
+    fi
+done
 echo ""
 
 cd "$MANIFESTS_DIR"
