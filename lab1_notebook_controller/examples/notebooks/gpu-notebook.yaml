@@ -1,0 +1,42 @@
+apiVersion: kubeflow.org/v1
+kind: Notebook
+metadata:
+  name: gpu-notebook
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - name: gpu-notebook
+        image: kubeflownotebookswg/jupyter-tensorflow-cuda-full:latest
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        resources:
+          requests:
+            cpu: "2.0"
+            memory: 4Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4.0"
+            memory: 8Gi
+            nvidia.com/gpu: "1"
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: gpu-notebook-workspace
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gpu-notebook-workspace
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+
