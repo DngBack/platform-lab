@@ -1034,6 +1034,66 @@ spec:
 - Built-in: Pod, Service, Deployment (có sẵn)
 - Custom: Notebook (phải install CRD trước)
 
+#### 8.1.1. Notebook CRD Chi Tiết
+
+**Notebook CRD Schema:**
+
+Notebook CRD (`notebooks.kubeflow.org`) định nghĩa cấu trúc của Notebook resource:
+
+```yaml
+apiVersion: kubeflow.org/v1
+kind: Notebook
+metadata:
+  name: <notebook-name>
+  namespace: <namespace>
+spec:
+  template:              # Pod template
+    spec:
+      containers:        # Container definitions
+      - name: <container-name>
+        image: <image>
+        resources:        # CPU, Memory, GPU
+          requests: {...}
+          limits: {...}
+      volumes:           # Volume mounts
+      - name: <volume-name>
+        persistentVolumeClaim:
+          claimName: <pvc-name>
+status:                  # Controller tự động update
+  ready: true/false
+  conditions: [...]
+```
+
+**Các Fields Quan Trọng:**
+
+1. **`spec.template`**: 
+   - Pod template (giống Pod spec)
+   - Controller sẽ tạo Pod từ template này
+   - Có thể định nghĩa containers, volumes, resources, env, etc.
+
+2. **`spec.template.spec.containers`**:
+   - Danh sách containers trong pod
+   - Mỗi container có image, resources, env, etc.
+
+3. **`spec.template.spec.volumes`**:
+   - Volumes để mount vào containers
+   - Thường dùng PVC cho persistent storage
+
+4. **`status.ready`**:
+   - Controller tự động update
+   - `true` = Pod running và Service created
+   - `false` = Đang chờ hoặc có lỗi
+
+**Kiểm Tra CRD Schema:**
+
+```bash
+# Xem CRD definition
+kubectl get crd notebooks.kubeflow.org -o yaml
+
+# Xem OpenAPI schema
+kubectl get crd notebooks.kubeflow.org -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema}'
+```
+
 ### 8.2. Controller Pattern
 
 **Định nghĩa:**
@@ -1067,6 +1127,187 @@ for {
     
     sleep(interval)
 }
+```
+
+#### 8.2.1. Chi Tiết Cách Controller Tạo Resources
+
+**1. Controller Tạo Pod:**
+
+Khi user tạo Notebook resource, controller sẽ:
+
+```go
+// Pseudo-code
+func reconcileNotebook(notebook *Notebook) {
+    // 1. Đọc spec.template từ Notebook
+    podTemplate := notebook.Spec.Template
+    
+    // 2. Tạo Pod từ template
+    pod := &corev1.Pod{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      notebook.Name + "-0",  // Format: <notebook-name>-0
+            Namespace:  notebook.Namespace,
+            Labels: map[string]string{
+                "notebook-name": notebook.Name,  // Label để select
+            },
+            OwnerReferences: []metav1.OwnerReference{
+                {
+                    APIVersion: "kubeflow.org/v1",
+                    Kind:       "Notebook",
+                    Name:       notebook.Name,
+                    UID:        notebook.UID,
+                },
+            },
+        },
+        Spec: podTemplate.Spec,  // Copy spec từ template
+    }
+    
+    // 3. Apply Pod vào cluster
+    client.Create(pod)
+}
+```
+
+**Điểm quan trọng:**
+- Pod name format: `<notebook-name>-0` (suffix `-0` cho StatefulSet-like naming)
+- Label `notebook-name`: Dùng để select pods của notebook
+- OwnerReference: Pod thuộc về Notebook (khi xóa Notebook → Pod tự động xóa)
+
+**2. Controller Tạo Service:**
+
+Controller tự động tạo Service để expose notebook:
+
+```go
+// Pseudo-code
+func createService(notebook *Notebook) {
+    service := &corev1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      notebook.Name,
+            Namespace: notebook.Namespace,
+            Labels: map[string]string{
+                "notebook-name": notebook.Name,
+            },
+            OwnerReferences: []metav1.OwnerReference{
+                {
+                    APIVersion: "kubeflow.org/v1",
+                    Kind:       "Notebook",
+                    Name:       notebook.Name,
+                    UID:        notebook.UID,
+                },
+            },
+        },
+        Spec: corev1.ServiceSpec{
+            Type: corev1.ServiceTypeClusterIP,
+            Ports: []corev1.ServicePort{
+                {
+                    Port:       80,
+                    TargetPort: intstr.FromInt(8888),  // Jupyter port
+                },
+            },
+            Selector: map[string]string{
+                "notebook-name": notebook.Name,  // Select pod
+            },
+        },
+    }
+    
+    client.Create(service)
+}
+```
+
+**Điểm quan trọng:**
+- Service name = Notebook name
+- Service type: `ClusterIP` (chỉ accessible trong cluster)
+- Selector: Dùng label `notebook-name` để route traffic tới pod
+- Port mapping: Service port 80 → Pod port 8888
+
+**3. Controller Mount Volumes:**
+
+Controller không tạo PVC, nhưng mount PVC vào Pod:
+
+```yaml
+# Trong Notebook spec
+spec:
+  template:
+    spec:
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: tensorflow-notebook-workspace  # PVC phải tồn tại trước
+      containers:
+      - name: tensorflow-notebook
+        volumeMounts:
+        - name: workspace
+          mountPath: /home/jovyan  # Mount vào container
+```
+
+**Điểm quan trọng:**
+- PVC phải được tạo **trước** khi tạo Notebook
+- Controller chỉ mount PVC vào Pod (không tạo PVC)
+- Mount path thường là `/home/jovyan` (Jupyter home directory)
+
+**4. Controller Update Status:**
+
+Controller liên tục update status của Notebook:
+
+```go
+// Pseudo-code
+func updateStatus(notebook *Notebook) {
+    // 1. Kiểm tra Pod status
+    pod := getPod(notebook.Name + "-0")
+    podReady := pod.Status.Phase == "Running" && 
+                pod.Status.ContainerStatuses[0].Ready
+    
+    // 2. Kiểm tra Service
+    service := getService(notebook.Name)
+    serviceExists := service != nil
+    
+    // 3. Update Notebook status
+    notebook.Status.Ready = podReady && serviceExists
+    notebook.Status.Conditions = []Condition{
+        {
+            Type:   "Ready",
+            Status: podReady && serviceExists,
+        },
+    }
+    
+    client.Update(notebook)
+}
+```
+
+**Điểm quan trọng:**
+- Status được update liên tục (reconcile loop)
+- `status.ready = true` khi Pod Running và Service exists
+- User có thể check status: `kubectl get notebooks`
+
+**Tóm Tắt Flow Chi Tiết:**
+
+```
+User tạo Notebook
+    ↓
+Controller detect (watch API)
+    ↓
+Controller đọc spec.template
+    ↓
+Controller tạo Pod:
+  - Name: <notebook-name>-0
+  - Labels: notebook-name=<notebook-name>
+  - Spec: từ spec.template
+  - OwnerReference: Notebook
+    ↓
+Controller tạo Service:
+  - Name: <notebook-name>
+  - Selector: notebook-name=<notebook-name>
+  - Port: 80 → 8888
+  - OwnerReference: Notebook
+    ↓
+Controller mount Volumes:
+  - Mount PVC vào Pod
+  - Mount path: /home/jovyan
+    ↓
+Controller update Status:
+  - Check Pod ready
+  - Check Service exists
+  - Update status.ready
+    ↓
+Reconcile loop tiếp tục (mỗi vài giây)
 ```
 
 ### 8.3. Kustomize Overlays
@@ -1104,6 +1345,172 @@ configMapGenerator:
 - Không duplicate manifests
 - Dễ maintain
 - Có thể combine nhiều overlays
+
+### 8.3. GPU Scheduling trong Kubernetes
+
+**Định nghĩa:**
+- Kubernetes hỗ trợ GPU scheduling thông qua Extended Resources
+- GPU được expose như một resource type: `nvidia.com/gpu`
+- Scheduler đảm bảo pod chỉ được schedule vào node có GPU available
+
+#### 8.3.1. GPU Resource trong Notebook
+
+**Notebook với GPU:**
+
+```yaml
+apiVersion: kubeflow.org/v1
+kind: Notebook
+metadata:
+  name: gpu-notebook
+spec:
+  template:
+    spec:
+      containers:
+      - name: gpu-notebook
+        image: kubeflownotebookswg/jupyter-tensorflow-cuda-full:latest
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"  # Expose tất cả GPUs
+        resources:
+          requests:
+            cpu: "2.0"
+            memory: 4Gi
+            nvidia.com/gpu: "1"  # Request 1 GPU
+          limits:
+            cpu: "4.0"
+            memory: 8Gi
+            nvidia.com/gpu: "1"  # Limit 1 GPU
+```
+
+**Giải thích:**
+- `nvidia.com/gpu`: Extended resource type cho NVIDIA GPU
+- `requests`: Minimum GPU cần (scheduler dùng để schedule)
+- `limits`: Maximum GPU được dùng (enforce bởi device plugin)
+
+#### 8.3.2. GPU Scheduling Flow
+
+**1. Node Report GPU Capacity:**
+
+Node phải report GPU capacity:
+
+```bash
+# Kiểm tra node có GPU không
+kubectl get nodes -o jsonpath='{.items[*].status.capacity}'
+
+# Output mẫu (node có GPU):
+{
+  "cpu": "4",
+  "memory": "8Gi",
+  "nvidia.com/gpu": "1"  # Node có 1 GPU
+}
+```
+
+**2. Device Plugin:**
+
+NVIDIA Device Plugin expose GPU resources:
+
+```bash
+# Install NVIDIA Device Plugin
+kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.1/nvidia-device-plugin.yml
+
+# Kiểm tra device plugin pod
+kubectl get pods -n kube-system | grep nvidia-device-plugin
+```
+
+**Device Plugin hoạt động:**
+- Chạy trên mỗi node có GPU
+- Report GPU capacity tới kubelet
+- Kubelet report lên API server
+- Scheduler biết node nào có GPU
+
+**3. Scheduler Select Node:**
+
+Khi pod request GPU:
+
+```
+1. Pod spec có: resources.requests.nvidia.com/gpu: "1"
+   ↓
+2. Scheduler tìm nodes có GPU available
+   ↓
+3. Scheduler check:
+   - Node có nvidia.com/gpu capacity >= 1?
+   - Node có GPU available (chưa được allocate)?
+   ↓
+4. Nếu có → Schedule pod vào node đó
+   ↓
+5. Nếu không → Pod ở trạng thái Pending
+```
+
+**4. Device Plugin Allocate GPU:**
+
+Sau khi pod được schedule:
+
+```
+1. Kubelet gọi device plugin
+   ↓
+2. Device plugin allocate GPU cho pod
+   ↓
+3. Device plugin set environment variables:
+   - NVIDIA_VISIBLE_DEVICES: GPU IDs
+   ↓
+4. Pod start với GPU access
+```
+
+#### 8.3.3. Kiểm Tra GPU Support
+
+**Kiểm tra cluster có GPU không:**
+
+```bash
+# 1. Kiểm tra nodes có GPU
+kubectl get nodes -o jsonpath='{.items[*].status.capacity}' | grep nvidia.com/gpu
+
+# 2. Kiểm tra device plugin
+kubectl get pods -n kube-system | grep nvidia-device-plugin
+
+# 3. Kiểm tra GPU allocation
+kubectl describe node <node-name> | grep -A 5 "Allocated resources"
+```
+
+**Kiểm tra pod có GPU không:**
+
+```bash
+# Xem pod resources
+kubectl describe pod <pod-name> -n <namespace> | grep -A 10 "Limits"
+
+# Xem GPU trong pod
+kubectl exec -n <namespace> <pod-name> -- nvidia-smi
+```
+
+#### 8.3.4. GPU Scheduling với Minikube
+
+**Minikube GPU Support:**
+
+```bash
+# Start minikube với GPU
+minikube start --driver=none --gpus=all
+
+# Hoặc với driver khác
+minikube start --driver=docker --gpus=all
+```
+
+**Lưu ý:**
+- Minikube cần driver hỗ trợ GPU (nvidia, docker với GPU support)
+- Cần install NVIDIA drivers trên host
+- Device plugin tự động install khi dùng `--gpus=all`
+
+**Troubleshooting GPU:**
+
+```bash
+# 1. Pod Pending vì không có GPU
+kubectl describe pod <pod-name> | grep -A 5 "Events"
+# Output: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu"
+
+# 2. Kiểm tra node capacity
+kubectl describe node <node-name> | grep nvidia.com/gpu
+
+# 3. Kiểm tra device plugin logs
+kubectl logs -n kube-system -l name=nvidia-device-plugin-ds
+```
 
 ### 8.4. Resources: Requests vs Limits
 
