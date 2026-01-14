@@ -59,3 +59,5 @@ echo ""
 print_info "To port-forward MLflow UI:"
 echo "  kubectl port-forward -n mlflow svc/mlflow-service 5000:5000"
 
+
+

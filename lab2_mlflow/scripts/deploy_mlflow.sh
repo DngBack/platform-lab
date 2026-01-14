@@ -121,3 +121,5 @@ print_info "To connect from a notebook, use:"
 echo "  mlflow.set_tracking_uri('http://mlflow-service.mlflow.svc.cluster.local:5000')"
 echo ""
 
+
+

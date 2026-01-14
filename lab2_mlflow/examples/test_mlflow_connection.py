@@ -69,3 +69,5 @@ print(f"  Internal: {MLFLOW_TRACKING_URI}")
 print(f"  Or port-forward: kubectl port-forward -n mlflow svc/mlflow-service 5000:5000")
 print(f"  Then open: http://localhost:5000")
 
+
+
